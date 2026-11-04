@@ -1,0 +1,563 @@
+generator client {
+  provider     = "prisma-client"
+  output       = "../src/generated/prisma"
+  moduleFormat = "esm"
+}
+
+datasource db {
+  provider = "mysql"
+  // Uncomment if your MySQL provider does not support foreign keys:
+  // relationMode = "prisma"
+}
+
+// ───────── Enums ─────────
+enum Channel {
+  X
+  TIKTOK
+  INSTAGRAM
+  ONLINE_NEWS
+  FACEBOOK
+  YOUTUBE
+  BLOG
+}
+
+enum SentimentLabel {
+  POSITIVE
+  NEUTRAL
+  NEGATIVE
+}
+
+enum IngestionSourceType {
+  EXCEL_UPLOAD
+  API_PULL
+  API_WEBHOOK
+}
+
+enum BatchStatus {
+  PENDING
+  PROCESSING
+  PAUSED
+  COMPLETED
+  COMPLETED_WITH_ERRORS
+  FAILED
+}
+
+enum UserRole {
+  SUPERADMIN // Zanroo internal: everything ADMIN can, plus managing AI credits; no credit limit
+  ADMIN
+  ANALYST
+  VIEWER
+}
+
+/// How an author is classified. Derived from Zanroo tags when not set by hand.
+enum AccountType {
+  KOL // influencer / creator
+  MEDIA // news site or media account
+  OFFICIAL // a brand's own account (Brand Voice)
+  OTHER // public, community
+}
+
+enum ChatRole {
+  USER
+  ASSISTANT
+}
+
+// ───────── Access & master data ─────────
+model User {
+  id               Int      @id @default(autoincrement())
+  email            String   @unique @db.VarChar(190)
+  name             String   @db.VarChar(120)
+  passwordHash     String   @db.VarChar(100)
+  role             UserRole @default(ANALYST)
+  /// AI Assistant answers allowed per WIB day. Reset daily at 00:00 WIB.
+  dailyChatCredits Int      @default(5)
+  createdAt        DateTime @default(now())
+
+  memberships  ProjectMember[]
+  batches      IngestionBatch[]
+  chatSessions ChatSession[]
+  chatUsage    ChatUsage[]
+
+  @@map("users")
+}
+
+model Project {
+  id          Int      @id @default(autoincrement())
+  name        String   @db.VarChar(200)
+  slug        String   @unique @db.VarChar(120)
+  description String?  @db.VarChar(500)
+  createdAt   DateTime @default(now())
+
+  /// Name in report titles: "Summary Report Social Listening {clientName} - {date range}". Falls back to name.
+  clientName           String? @db.VarChar(200)
+  /// E-mail addresses that receive summary reports.
+  reportRecipients     Json?
+  monthlyReportEnabled Boolean @default(false)
+  /// Day of month (1-28, WIB) the previous month's report is sent; leaves time to upload the month's data.
+  monthlyReportDay     Int     @default(1)
+  /// Last month sent ("YYYY-MM"), so the daily cron sends each month once.
+  lastMonthlyReport    String? @db.VarChar(7)
+
+  // Net Sentiment formula: CIMB counts neutral mentions in the base, Kobelco does not.
+  nssIncludeNeutral Boolean @default(true)
+  showNss           Boolean @default(true)
+
+  // GEO Intelligence: one benchmark per project, run at most once per calendar month (WIB).
+  geoEnabled       Boolean @default(false)
+  geoRunDay        Int     @default(1) // day of month the scheduled run starts (1..28)
+  geoRunsPerPrompt Int     @default(1) // independent runs per prompt x model x mode (1..3)
+  geoProfile       Json? // { industry, market, language, description, targetName }
+
+  members      ProjectMember[]
+  brands       Brand[]
+  mentions     Mention[]
+  batches      IngestionBatch[]
+  chatSessions ChatSession[]
+  insights     AiInsight[]
+  categories   Category[]
+  accounts     AccountProfile[]
+  geoPrompts   GeoPrompt[]
+  geoBatches   GeoBatch[]
+
+  @@map("projects")
+}
+
+model ProjectMember {
+  userId    Int
+  projectId Int
+  user      User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@id([userId, projectId])
+  @@index([projectId])
+  @@map("project_members")
+}
+
+model Brand {
+  id        Int      @id @default(autoincrement())
+  projectId Int
+  name      String   @db.VarChar(120)
+  isOwn     Boolean  @default(false) // true = our brand, false = competitor
+  color     String?  @db.VarChar(9)
+  aliases   Json? // keywords (exact, case-insensitive) from the Zanroo Keyword column
+  domains   Json? // GEO: websites the brand owns, e.g. ["im3.id", "tri.co.id"]
+  createdAt DateTime @default(now())
+
+  project  Project        @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  mentions MentionBrand[]
+
+  @@unique([projectId, name])
+  @@map("brands")
+}
+
+// ───────── Raw social listening data ─────────
+model Mention {
+  id         Int                 @id @default(autoincrement())
+  projectId  Int
+  batchId    Int?
+  externalId String              @db.VarChar(100) // Zanroo MID / API id
+  sourceType IngestionSourceType
+  channel    Channel
+  postType   String?             @db.VarChar(20) // Commented, Tweeted, Posted, Quoted, Shared
+
+  title       String?  @db.VarChar(500)
+  content     String?  @db.Text // can be empty (emoji/sticker comments)
+  url         String?  @db.VarChar(1000)
+  publishedAt DateTime // UTC
+  ingestedAt  DateTime @default(now())
+
+  authorHandle    String? @db.VarChar(150)
+  authorName      String? @db.VarChar(200)
+  authorFollowers Int?
+  authorVerified  Boolean @default(false)
+
+  likes       Int @default(0)
+  shares      Int @default(0)
+  comments    Int @default(0)
+  views       Int @default(0)
+  reach       Int @default(0) // EstimatedReach
+  engagements Int @default(0) // total engagement reported by the source
+
+  sentimentLabel SentimentLabel
+  sentimentScore Decimal?       @db.Decimal(4, 3) // optional; Zanroo exports only have labels
+
+  location String? @db.VarChar(200)
+  tags     Json? // Zanroo Tag column (issues/topics)
+  extra    Json? // Where, Country, Types, category labels set to 1
+
+  project    Project           @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  batch      IngestionBatch?   @relation(fields: [batchId], references: [id], onDelete: SetNull)
+  brands     MentionBrand[]
+  categories MentionCategory[]
+
+  @@unique([projectId, externalId]) // ingestion idempotency key
+  @@index([projectId, publishedAt])
+  @@index([projectId, channel, publishedAt])
+  @@index([projectId, sentimentLabel, publishedAt])
+  @@index([batchId])
+  @@map("mentions")
+}
+
+model MentionBrand {
+  mentionId Int
+  brandId   Int
+  mention   Mention @relation(fields: [mentionId], references: [id], onDelete: Cascade)
+  brand     Brand   @relation(fields: [brandId], references: [id], onDelete: Cascade)
+
+  @@id([mentionId, brandId])
+  @@index([brandId])
+  @@map("mention_brands")
+}
+
+// ───────── Ingestion audit trail ─────────
+model IngestionBatch {
+  id               Int                 @id @default(autoincrement())
+  projectId        Int
+  createdById      Int?
+  sourceType       IngestionSourceType
+  fileName         String?             @db.VarChar(255)
+  sourceInput      Json? // adapter input, e.g. { fileUrl }, so the batch can be resumed
+  status           BatchStatus         @default(PENDING)
+  processedRows    Int                 @default(0) // last persisted position (for resume)
+  insertedRows     Int                 @default(0)
+  skippedRows      Int                 @default(0) // duplicates
+  failedRows       Int                 @default(0)
+  unmappedKeywords Json? // keywords on rows without a brand: { keyword: count }
+  errorMessage     String?             @db.VarChar(500)
+  startedAt        DateTime?
+  finishedAt       DateTime?
+  createdAt        DateTime            @default(now())
+  updatedAt        DateTime            @updatedAt
+
+  project   Project             @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  createdBy User?               @relation(fields: [createdById], references: [id], onDelete: SetNull)
+  mentions  Mention[]
+  errors    IngestionRowError[]
+
+  @@index([projectId, createdAt])
+  @@map("ingestion_batches")
+}
+
+model IngestionRowError {
+  id      Int    @id @default(autoincrement())
+  batchId Int
+  rowRef  String @db.VarChar(100) // Excel row number / API item id
+  message String @db.VarChar(500)
+  raw     Json?
+
+  batch IngestionBatch @relation(fields: [batchId], references: [id], onDelete: Cascade)
+
+  @@index([batchId])
+  @@map("ingestion_row_errors")
+}
+
+// ───────── AI Brand Assistant ─────────
+/// AI Assistant usage per user per WIB day. Available today = user.dailyChatCredits + bonus - used.
+model ChatUsage {
+  userId Int
+  day    DateTime @db.Date // WIB calendar day
+  used   Int      @default(0) // answered questions
+  bonus  Int      @default(0) // extra credits a superadmin granted for this day only
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([userId, day])
+  @@map("chat_usage")
+}
+
+model ChatSession {
+  id        String   @id @default(uuid()) @db.Char(36) // session_id
+  userId    Int
+  projectId Int
+  title     String?  @db.VarChar(200)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user     User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  project  Project       @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  messages ChatMessage[]
+
+  @@index([userId, projectId, updatedAt])
+  @@map("chat_sessions")
+}
+
+model ChatMessage {
+  id              Int      @id @default(autoincrement())
+  sessionId       String   @db.Char(36)
+  role            ChatRole
+  content         String   @db.Text
+  filtersSnapshot Json? // active dashboard filter when the question was asked
+  toolCalls       Json? // tools called + arguments (answer audit)
+  model           String?  @db.VarChar(80)
+  inputTokens     Int?
+  outputTokens    Int?
+  createdAt       DateTime @default(now())
+
+  session ChatSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@index([sessionId, createdAt])
+  @@map("chat_messages")
+}
+
+// ───────── AI Insights ─────────
+/// A written briefing for one period. Every finding cites mention ids so it links back to posts.
+model AiInsight {
+  id          Int      @id @default(autoincrement())
+  projectId   Int
+  periodFrom  DateTime @db.Date // WIB, inclusive
+  periodTo    DateTime @db.Date // WIB, inclusive
+  filter      Json // filter used (channels, sentiments, brands)
+  headline    String   @db.VarChar(500)
+  findings    Json // [{ title, body, citations: number[] }]
+  model       String?  @db.VarChar(100)
+  createdById Int?
+  createdAt   DateTime @default(now())
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([projectId, periodFrom, periodTo])
+  @@map("ai_insights")
+}
+
+/// Topic category an admin defines per project. A mention belongs to it when it carries one of the
+/// Zanroo tags/categories in `zanrooTags`, or its text contains one of `keywords` (whole word, any case).
+model Category {
+  id         Int      @id @default(autoincrement())
+  projectId  Int
+  name       String   @db.VarChar(80)
+  color      String?  @db.VarChar(9)
+  zanrooTags Json? // string[]: exact Zanroo tag or category names
+  keywords   Json? // string[]
+  sortOrder  Int      @default(0)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  project  Project           @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  mentions MentionCategory[]
+
+  @@unique([projectId, name])
+  @@map("categories")
+}
+
+model MentionCategory {
+  mentionId  Int
+  categoryId Int
+  mention    Mention  @relation(fields: [mentionId], references: [id], onDelete: Cascade)
+  category   Category @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+
+  @@id([mentionId, categoryId])
+  @@index([categoryId])
+  @@map("mention_categories")
+}
+
+/// Manual classification of an author, set by an analyst (single or bulk). Applies to every
+/// mention by that account, past and future uploads.
+model AccountProfile {
+  id          Int          @id @default(autoincrement())
+  projectId   Int
+  channel     Channel
+  handle      String       @db.VarChar(150) // lower case, without '@'
+  accountType AccountType? // null = derive from Zanroo tags
+  isPaid      Boolean? // null = not tagged; true = paid/endorsed; false = organic
+  updatedById Int?
+  updatedAt   DateTime     @updatedAt
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, channel, handle])
+  @@map("account_profiles")
+}
+
+// ───────── GEO Intelligence ─────────
+
+enum GeoPromptCategory {
+  CATEGORY_DISCOVERY
+  BRAND_RECOMMENDATION
+  PROBLEM_SOLUTION
+  BRAND_COMPARISON
+  BRAND_AWARENESS
+  BRAND_REPUTATION
+}
+
+enum GeoPromptStatus {
+  DRAFT // suggested or edited, not in the benchmark yet
+  APPROVED // in the benchmark
+  ARCHIVED
+}
+
+/// KNOWLEDGE = plain chat completion; SEARCH = web_search_options (only for models that return citations).
+enum GeoMode {
+  KNOWLEDGE
+  SEARCH
+}
+
+enum GeoBatchStatus {
+  RUNNING
+  PAUSED // time budget hit; resumed by the page or the cron
+  COMPLETED
+  PARTIAL // some runs failed
+  FAILED
+}
+
+enum GeoRunStatus {
+  PENDING
+  SUCCEEDED
+  FAILED
+}
+
+enum GeoRecommendation {
+  RECOMMENDED
+  POSITIVE // discussed positively, not recommended
+  NEUTRAL
+  NEGATIVE // discouraged
+  NOT_MENTIONED
+  UNCLEAR
+}
+
+model GeoPrompt {
+  id        Int               @id @default(autoincrement())
+  projectId Int
+  category  GeoPromptCategory
+  branded   Boolean           @default(false) // the prompt names the target brand
+  language  String            @default("id") @db.VarChar(10)
+  status    GeoPromptStatus   @default(DRAFT)
+  source    String            @default("manual") @db.VarChar(20) // manual | suggested
+  createdAt DateTime          @default(now())
+  updatedAt DateTime          @updatedAt
+
+  project  Project            @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  versions GeoPromptVersion[]
+
+  @@index([projectId, status])
+  @@map("geo_prompts")
+}
+
+/// Immutable: editing a prompt adds a version; runs keep the version they used.
+model GeoPromptVersion {
+  id          Int      @id @default(autoincrement())
+  promptId    Int
+  version     Int
+  text        String   @db.Text
+  createdById Int?
+  createdAt   DateTime @default(now())
+
+  prompt GeoPrompt @relation(fields: [promptId], references: [id], onDelete: Cascade)
+  runs   GeoRun[]
+
+  @@unique([promptId, version])
+  @@map("geo_prompt_versions")
+}
+
+/// One benchmark execution. Monthly: at most one per project per month ((projectId, period) is unique).
+/// Ad-hoc (manual, paid with AI credits): period is null, so any number per month.
+model GeoBatch {
+  id          Int            @id @default(autoincrement())
+  projectId   Int
+  period      String?        @db.VarChar(7) // YYYY-MM, WIB; null for manual (ad-hoc) runs
+  kind        String         @default("monthly") @db.VarChar(10) // monthly | adhoc
+  label       String?        @db.VarChar(120)
+  status      GeoBatchStatus @default(RUNNING)
+  trigger     String         @db.VarChar(20) // scheduled | manual
+  config      Json // models, modes, runsPerPrompt, evaluator, evaluation version, prompt version ids
+  total       Int            @default(0)
+  succeeded   Int            @default(0)
+  failed      Int            @default(0)
+  createdById Int?
+  startedAt   DateTime       @default(now())
+  finishedAt  DateTime?
+  updatedAt   DateTime       @updatedAt
+
+  project Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  runs    GeoRun[]
+
+  @@unique([projectId, period])
+  @@map("geo_batches")
+}
+
+/// Prompt version x model x mode x run number. The raw provider response is never modified.
+model GeoRun {
+  id               Int          @id @default(autoincrement())
+  batchId          Int
+  projectId        Int
+  promptVersionId  Int
+  model            String       @db.VarChar(100)
+  mode             GeoMode
+  runNo            Int
+  status           GeoRunStatus @default(PENDING)
+  attempts         Int          @default(0)
+  latencyMs        Int?
+  promptTokens     Int?
+  completionTokens Int?
+  reasoningTokens  Int?
+  requestId        String?      @db.VarChar(120)
+  errorType        String?      @db.VarChar(60)
+  errorMessage     String?      @db.VarChar(500)
+  rawResponse      Json?
+  text             String?      @db.MediumText
+  executedAt       DateTime?
+
+  batch         GeoBatch         @relation(fields: [batchId], references: [id], onDelete: Cascade)
+  promptVersion GeoPromptVersion @relation(fields: [promptVersionId], references: [id])
+  citations     GeoCitation[]
+  evaluations   GeoEvaluation[]
+
+  @@unique([batchId, promptVersionId, model, mode, runNo])
+  @@index([projectId, status])
+  @@map("geo_runs")
+}
+
+/// Citations exactly as returned by the provider (Gemini grounding: domain in title, Google redirect URL).
+model GeoCitation {
+  id         Int     @id @default(autoincrement())
+  runId      Int
+  domain     String  @db.VarChar(255)
+  url        String  @db.VarChar(1000)
+  startIndex Int?
+  endIndex   Int?
+  ownedBy    String? @db.VarChar(20) // TARGET | COMPETITOR | null
+
+  run GeoRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+
+  @@index([runId])
+  @@map("geo_citations")
+}
+
+/// Versioned evaluation of one run. Re-evaluating adds a row; old ones stay.
+model GeoEvaluation {
+  id             Int      @id @default(autoincrement())
+  runId          Int
+  version        String   @db.VarChar(20)
+  evaluatorModel String?  @db.VarChar(100)
+  status         String   @db.VarChar(20) // ok | failed
+  error          String?  @db.VarChar(500)
+  raw            Json? // evaluator output
+  createdAt      DateTime @default(now())
+
+  run     GeoRun           @relation(fields: [runId], references: [id], onDelete: Cascade)
+  results GeoBrandResult[]
+
+  @@index([runId, createdAt])
+  @@map("geo_evaluations")
+}
+
+/// One tracked entity in one evaluated response: the target group (brandId null) or a competitor.
+model GeoBrandResult {
+  id             Int               @id @default(autoincrement())
+  evaluationId   Int
+  isTarget       Boolean
+  brandId        Int?
+  name           String            @db.VarChar(120)
+  mentioned      Boolean
+  matches        Json? // matched alias strings
+  recommendation GeoRecommendation
+  position       Int? // rank in a numbered list, null when the answer has no list
+  listSize       Int?
+  sentiment      String?           @db.VarChar(10) // positive | neutral | negative | mixed | unknown
+  evidence       String?           @db.VarChar(600)
+  manual         Boolean           @default(false) // corrected by an analyst
+
+  evaluation GeoEvaluation @relation(fields: [evaluationId], references: [id], onDelete: Cascade)
+
+  @@index([evaluationId])
+  @@map("geo_brand_results")
+}
