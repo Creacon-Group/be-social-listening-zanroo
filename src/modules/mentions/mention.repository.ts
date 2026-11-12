@@ -1,6 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import { PrismaService } from '../../database/prisma.service.js';
 import { Prisma } from '../../generated/prisma/client.js';
+import { derivedSet } from './mention-sql.js';
 import type {
   IngestionContext,
   ResolvedMention,
@@ -42,6 +43,32 @@ const backfillPatch = (extra?: Record<string, unknown>) => {
 const withKeywords = (m: ResolvedMention['mention']) =>
   m.brandKeywords.length ? { ...m.extra, keywords: m.brandKeywords } : m.extra;
 
+const union = <T>(a?: T[], b?: T[]) =>
+  a || b ? [...new Set([...(a ?? []), ...(b ?? [])])] : undefined;
+
+export function mergeByExternalId(items: ResolvedMention[]) {
+  const byId = new Map<string, ResolvedMention>();
+  for (const item of items) {
+    const first = byId.get(item.mention.externalId);
+    if (!first) {
+      byId.set(item.mention.externalId, item);
+      continue;
+    }
+    byId.set(item.mention.externalId, {
+      brandIds: union(first.brandIds, item.brandIds)!,
+      mention: {
+        ...first.mention,
+        brandKeywords: union(
+          first.mention.brandKeywords,
+          item.mention.brandKeywords,
+        )!,
+        tags: union(first.mention.tags, item.mention.tags),
+      },
+    });
+  }
+  return [...byId.values()];
+}
+
 @Injectable()
 export class PrismaMentionWriter implements MentionWriter {
   constructor(private readonly prisma: PrismaService) {}
@@ -49,10 +76,9 @@ export class PrismaMentionWriter implements MentionWriter {
   async insertMany(ctx: IngestionContext, items: ResolvedMention[]) {
     if (!items.length) return { inserted: 0, skipped: 0 };
 
-    // The same MID can appear twice in one chunk; keep the first so counts stay honest.
-    const unique = [
-      ...new Map(items.map((i) => [i.mention.externalId, i])).values(),
-    ];
+    // The same MID can appear several times in one chunk (Zanroo: one row per keyword).
+    // Keep one row and merge the brands, keywords and tags of the others into it.
+    const unique = mergeByExternalId(items);
 
     const { count, existing } = await this.prisma.$transaction(
       async (tx) => {
@@ -124,8 +150,12 @@ export class PrismaMentionWriter implements MentionWriter {
     // Outside the transaction: rows that already existed keep their data but get fields added
     // in later versions (preview, gender, region), so re-uploading a file backfills them.
     await this.backfill(ctx.projectId, existing);
+    await this.syncDerived(
+      ctx.projectId,
+      unique.map((i) => i.mention.externalId),
+    );
 
-    return { inserted: count, skipped: items.length - count };
+    return { inserted: count, skipped: unique.length - count };
   }
 
   async refreshMetrics(projectId: number, items: ResolvedMention[]) {
@@ -155,6 +185,15 @@ export class PrismaMentionWriter implements MentionWriter {
       where: { projectId, externalId: { in: externalIds } },
     });
     return count;
+  }
+
+  /** Fill the derived columns (owned, tier, demographics, reactions) of these rows from tags and extra. */
+  private async syncDerived(projectId: number, externalIds: string[]) {
+    for (let i = 0; i < externalIds.length; i += 500) {
+      await this.prisma.$executeRaw`
+        UPDATE mentions m SET ${derivedSet()}
+        WHERE m.projectId = ${projectId} AND m.externalId IN (${Prisma.join(externalIds.slice(i, i + 500))})`;
+    }
   }
 
   /**

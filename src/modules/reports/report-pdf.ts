@@ -66,13 +66,11 @@ export function renderPdf(d: ReportData, charts: Charts): Promise<Buffer> {
         .lineWidth(0.75)
         .strokeColor(C.accentLine)
         .stroke();
-      doc
-        .fillColor(C.accent)
-        .text('Beta', px, py + 3, {
-          width: pw,
-          align: 'center',
-          lineBreak: false,
-        });
+      doc.fillColor(C.accent).text('Beta', px, py + 3, {
+        width: pw,
+        align: 'center',
+        lineBreak: false,
+      });
       doc.x = 40;
       doc.y = after;
     }
