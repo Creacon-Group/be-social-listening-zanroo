@@ -425,7 +425,12 @@ export class AnalyticsService {
       interval,
       buckets: bucketKeys(f.from, f.to, interval),
       totalBrandMentions: totalMentions,
-      own: { ...own, sov: pct(num(group.ownMentions), num(group.allMentions)) },
+      own: {
+        ...own,
+        sov: pct(num(group.ownMentions), num(group.allMentions)),
+        // Denominator of own.sov, so the UI can say what the share is of (unique mentions naming any brand).
+        allMentions: num(group.allMentions),
+      },
       brands,
       trend: trend.map((t) => ({
         day: String(t.day),

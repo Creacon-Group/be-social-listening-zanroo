@@ -3,15 +3,21 @@ import {
   Body,
   Controller,
   Get,
+  Headers,
   Param,
   ParseIntPipe,
   Post,
+  ServiceUnavailableException,
+  UnauthorizedException,
 } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { ApiTags } from '@nestjs/swagger';
 import { Type } from 'class-transformer';
 import { IsOptional, ValidateNested } from 'class-validator';
-import { type AuthUser, CurrentUser } from '../../common/auth.js';
+import { type AuthUser, CurrentUser, Public } from '../../common/auth.js';
 import { RateLimit } from '../../common/rate-limit.js';
+import { bearer, sameSecret } from '../../common/secret.js';
+import type { Env } from '../../config/env.js';
 import { MentionFilterDto } from '../mentions/mention-filter.js';
 import { InsightsService } from './insights.service.js';
 
@@ -52,5 +58,26 @@ export class InsightsController {
     @CurrentUser() user: AuthUser,
   ) {
     return this.insights.generate(projectId, dto.filter, user.id);
+  }
+}
+
+/** Vercel Cron (vercel.json), daily at 06:00 WIB, with "Authorization: Bearer $CRON_SECRET". */
+@ApiTags('insights')
+@Controller('cron')
+export class InsightsCronController {
+  constructor(
+    private readonly insights: InsightsService,
+    private readonly config: ConfigService<Env, true>,
+  ) {}
+
+  @Public()
+  @Get('insights')
+  run(@Headers('authorization') auth?: string) {
+    const secret = this.config.get('CRON_SECRET', { infer: true });
+    if (!secret)
+      throw new ServiceUnavailableException('CRON_SECRET is not set');
+    const given = bearer(auth);
+    if (!given || !sameSecret(given, secret)) throw new UnauthorizedException();
+    return this.insights.dailyCron();
   }
 }
